@@ -41,7 +41,11 @@ def auto_map_from_rsl(project: PLCProject) -> Dict[str, str]:
 
 
 def auto_map_from_acd(project: PLCProject) -> Dict[str, str]:
-    """Generate tag_name → suggested_SLC_address for an ACD-sourced project."""
+    """Generate tag_name → SLC_address for an ACD-sourced project.
+
+    Uses I/O alias definitions from the ACD when available (tag.alias_for).
+    Falls back to sequential heuristic assignment for tags without aliases.
+    """
     mapping: Dict[str, str] = {}
     input_counter: Dict[int, int] = {}   # slot → next bit
     output_counter: Dict[int, int] = {}
@@ -55,6 +59,10 @@ def auto_map_from_acd(project: PLCProject) -> Dict[str, str]:
         for tag in program.tags:
             name = tag.name
             if name in mapping:
+                continue
+            # Use actual alias address from ACD if present
+            if tag.alias_for:
+                mapping[name] = tag.alias_for
                 continue
             dt = tag.data_type.upper()
             if dt == "TIMER":

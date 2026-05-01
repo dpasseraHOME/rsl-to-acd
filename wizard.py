@@ -241,6 +241,18 @@ def address_mapping_step(project, source_ext: str) -> dict:
         auto_map = translate.auto_map_from_acd(project)
         direction = "tag → SLC-500 address"
         col_a, col_b = "Studio 5000 Tag", "SLC-500 Address"
+
+        # Count how many addresses came from ACD alias definitions vs. heuristics
+        all_tags = [t for p in project.programs for t in p.tags]
+        alias_count = sum(1 for t in all_tags if t.alias_for and t.name in auto_map)
+        heuristic_count = len(auto_map) - alias_count
+        if alias_count > 0 and heuristic_count == 0:
+            success(f"All {alias_count} addresses were read from the ACD's I/O configuration.")
+        elif alias_count > 0:
+            success(f"{alias_count} address(es) read from the ACD's I/O configuration.")
+            warn(f"{heuristic_count} tag(s) had no I/O alias — addresses were auto-assigned.")
+        else:
+            warn("No I/O aliases found in ACD — all addresses were auto-assigned. Review before downloading to hardware.")
     else:
         auto_map = translate.auto_map_from_rsl(project)
         direction = "SLC-500 address → tag name"

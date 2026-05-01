@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import sqlite3
+import struct
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -37,25 +38,10 @@ def read_file(path: str | Path) -> PLCProject:
 def _build_project(cur: sqlite3.Cursor, name: str) -> PLCProject:
     project = PLCProject(name=name)
 
-    # ── Tags (program-scoped) ──────────────────────────────────────────────
-    # comps table holds tag names; filter by known tag types
-    cur.execute(
-        "SELECT comp_name, object_id FROM comps "
-        "WHERE comp_name NOT LIKE 'Rx%' "
-        "  AND comp_name NOT LIKE '$%' "
-        "  AND comp_name NOT IN ('MainProgram','MainRoutine','RxProgramCollection',"
-        "                        'RxRoutineCollection','RxTagCollection',"
-        "                        'RxDataCollection','RxAlarmDigitalCollection',"
-        "                        'RxAlarmAnalogCollection','RxHMIBCCollection',"
-        "                        'RxBEOCollection','RxEEOCollection',"
-        "                        'RxMsgCollection','RxChartCollection',"
-        "                        'RxLabelCollection') "
-        "  AND LENGTH(comp_name) > 0"
-    )
-    all_comps = {row[1]: row[0] for row in cur.fetchall()}
+    # ── Alias map: tag name → SLC-500 address (from Studio 5000 alias defs) ──
+    alias_map = _read_tag_alias_map(cur)
 
-    # Grab typed tag info from comps name list that appears in TagInfo context
-    # We rely on the rung operand names to know which are real user tags
+    # ── Rungs ─────────────────────────────────────────────────────────────
     cur.execute("SELECT object_id, rung FROM rungs")
     raw_rungs = cur.fetchall()
 
@@ -64,9 +50,10 @@ def _build_project(cur: sqlite3.Cursor, name: str) -> PLCProject:
     for _, rung_text in raw_rungs:
         _scan_operands(rung_text, referenced)
 
-    # Build tag list
+    # Build tag list, attaching alias addresses where available
     program_tags = [
-        Tag(name=n, data_type=t) for n, t in sorted(referenced.items())
+        Tag(name=n, data_type=t, alias_for=alias_map.get(n))
+        for n, t in sorted(referenced.items())
     ]
 
     # ── Comments keyed by object_id ───────────────────────────────────────
@@ -95,6 +82,63 @@ def _build_project(cur: sqlite3.Cursor, name: str) -> PLCProject:
     )
     project.programs.append(program)
     return project
+
+
+def _read_tag_alias_map(cur: sqlite3.Cursor) -> Dict[str, str]:
+    """Build tag_name → SLC-500 address from alias tag definitions in the ACD.
+
+    Studio 5000 stores alias-for paths (e.g. Local:1:I.Data.0) in the
+    comments table as tag_reference.  We look them up via the comment_id
+    embedded in each tag's binary record blob.
+    """
+    alias_map: Dict[str, str] = {}
+    try:
+        cur.execute("SELECT comp_name, record FROM comps WHERE LENGTH(record) > 14")
+        rows = cur.fetchall()
+    except Exception:
+        return alias_map
+
+    for comp_name, record in rows:
+        try:
+            record = bytes(record)
+            if len(record) < 14:
+                continue
+            cip_type = struct.unpack_from("<H", record, 10)[0]
+            if cip_type not in (0x68, 0x6B):  # only tag objects
+                continue
+            comment_id = struct.unpack_from("<H", record, 12)[0]
+            parent_key = (comment_id * 0x10000) + cip_type
+
+            cur.execute(
+                "SELECT tag_reference FROM comments WHERE parent=? AND tag_reference != ''",
+                (parent_key,),
+            )
+            for (tag_ref,) in cur.fetchall():
+                slc_addr = _io_path_to_slc(tag_ref)
+                if slc_addr:
+                    alias_map[comp_name] = slc_addr
+                    break
+        except Exception:
+            continue
+
+    return alias_map
+
+
+def _io_path_to_slc(path: str) -> Optional[str]:
+    """Convert a Studio 5000 I/O path to an SLC-500 address string.
+
+    Local:N:I.Data.B  →  I:N/B
+    Local:N:O.Data.B  →  O:N/B
+    Local:N:I.Data    →  I:N      (word-level)
+    Local:N:O.Data    →  O:N
+    """
+    m = re.match(r"Local:(\d+):(I|O)\.Data\.(\d+)$", path, re.IGNORECASE)
+    if m:
+        return f"{m.group(2).upper()}:{m.group(1)}/{m.group(3)}"
+    m = re.match(r"Local:(\d+):(I|O)\.Data$", path, re.IGNORECASE)
+    if m:
+        return f"{m.group(2).upper()}:{m.group(1)}"
+    return None
 
 
 def _is_metadata_comment(text: str) -> bool:

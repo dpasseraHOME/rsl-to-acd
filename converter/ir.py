@@ -56,6 +56,7 @@ class Tag:
     name: str
     data_type: str = "BOOL"
     value: Optional[str] = None
+    alias_for: Optional[str] = None  # SLC-500 address read from ACD alias definition
 
 
 @dataclass
