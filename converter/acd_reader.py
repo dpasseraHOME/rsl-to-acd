@@ -3,6 +3,7 @@
 from __future__ import annotations
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -19,11 +20,17 @@ from .ir import Branch, Instruction, PLCProject, Program, Routine, Rung, RungEle
 def read_file(path: str | Path) -> PLCProject:
     """Extract an ACD file and return a PLCProject."""
     path = Path(path)
-    with tempfile.TemporaryDirectory() as tmp:
+    tmp = tempfile.mkdtemp()
+    try:
         export = ExportL5x(str(path), _temp_dir=tmp)
         cur = export._cur
         project = _build_project(cur, name=path.stem)
-        export._db.close()  # release file lock before Windows deletes the temp dir
+        export._db.close()
+    finally:
+        # ignore_errors=True because acd-tools may hold open handles to the
+        # extracted binary files (Comments.Dat, Comps.Dat, etc.) on Windows;
+        # the OS will clean the temp dir on reboot if this silent-fails here.
+        shutil.rmtree(tmp, ignore_errors=True)
     return project
 
 
