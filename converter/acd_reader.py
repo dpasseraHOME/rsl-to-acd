@@ -8,6 +8,9 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from loguru import logger as _loguru_logger
+_loguru_logger.disable("acd")
+
 from acd.l5x.export_l5x import ExportL5x
 
 from .ir import Branch, Instruction, PLCProject, Program, Routine, Rung, RungElement, Tag
@@ -19,7 +22,9 @@ def read_file(path: str | Path) -> PLCProject:
     with tempfile.TemporaryDirectory() as tmp:
         export = ExportL5x(str(path), _temp_dir=tmp)
         cur = export._cur
-        return _build_project(cur, name=path.stem)
+        project = _build_project(cur, name=path.stem)
+        export._db.close()  # release file lock before Windows deletes the temp dir
+    return project
 
 
 def _build_project(cur: sqlite3.Cursor, name: str) -> PLCProject:
