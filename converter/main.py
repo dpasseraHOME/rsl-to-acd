@@ -63,6 +63,8 @@ def main(argv=None):
     # diagnose
     p = sub.add_parser("diagnose", help="Dump raw tag/address data from an ACD for debugging")
     p.add_argument("input", help="Input .ACD file")
+    p.add_argument("--known", metavar="TAG=ADDR", nargs="*",
+                   help="Known tag=address pairs for targeted search, e.g. Motor_1=O:2/0")
 
     args = parser.parse_args(argv)
 
@@ -118,7 +120,12 @@ def main(argv=None):
     elif args.cmd == "diagnose":
         if Path(args.input).suffix.lower() != ".acd":
             sys.exit("diagnose only works on .acd files")
-        acd_reader.diagnose(args.input)
+        known = {}
+        for pair in (args.known or []):
+            if "=" in pair:
+                tag, addr = pair.split("=", 1)
+                known[tag.strip()] = addr.strip()
+        acd_reader.diagnose(args.input, known=known or None)
 
 
 def _load(path: str) -> PLCProject:

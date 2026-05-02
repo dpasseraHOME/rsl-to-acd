@@ -18,24 +18,24 @@ from acd.l5x.export_l5x import ExportL5x
 from .ir import Branch, Instruction, PLCProject, Program, Routine, Rung, RungElement, Tag
 
 
-def diagnose(path: str | Path) -> None:
+def diagnose(path: str | Path, known: Dict[str, str] = None) -> None:
     """Print a raw diagnostic dump of tag-related data in an ACD's SQLite DB.
 
-    Run this when you need to understand how addresses are stored so the
-    converter can be updated to read them correctly.
+    known: optional dict of tag_name → expected_slc_address for targeted
+           binary search across all DB blobs.
     """
     path = Path(path)
     tmp = tempfile.mkdtemp()
     try:
         export = ExportL5x(str(path), _temp_dir=tmp)
         cur = export._cur
-        _print_diagnose(cur)
+        _print_diagnose(cur, known=known)
         export._db.close()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _print_diagnose(cur: sqlite3.Cursor) -> None:
+def _print_diagnose(cur: sqlite3.Cursor, known: Dict[str, str] = None) -> None:
     from acd.generated.comps.rx_generic import RxGeneric
 
     # ── 1. Tags referenced in rungs ───────────────────────────────────────
@@ -50,82 +50,89 @@ def _print_diagnose(cur: sqlite3.Cursor) -> None:
     print(f"ACD DIAGNOSTIC DUMP")
     print(f"{'='*70}")
 
-    # ── 2. comments.tag_reference for rung tags ───────────────────────────
-    print(f"\n--- comments.tag_reference for rung-referenced tags ---")
+    # ── 2. Full attr[0x01] hex for all rung tags ──────────────────────────
+    print(f"\n--- Full extended record data per rung tag ---")
     for tag_name in rung_tags:
-        cur.execute("SELECT comp_name, record FROM comps WHERE comp_name=?", (tag_name,))
-        rows = cur.fetchall()
-        if not rows:
-            print(f"  {tag_name:30s}  [not found in comps]")
-            continue
-        for _, record in rows:
-            try:
-                record = bytes(record)
-                if len(record) < 14:
-                    continue
-                cip_type = struct.unpack_from("<H", record, 10)[0]
-                comment_id = struct.unpack_from("<H", record, 12)[0]
-                parent_key = (comment_id * 0x10000) + cip_type
-                cur.execute(
-                    "SELECT tag_reference, record_string, record_type FROM comments WHERE parent=?",
-                    (parent_key,),
-                )
-                comment_rows = cur.fetchall()
-                if comment_rows:
-                    for tag_ref, rec_str, rec_type in comment_rows:
-                        print(f"  {tag_name:30s}  cip=0x{cip_type:02X}  type={rec_type}  "
-                              f"tag_ref={tag_ref!r:40s}  comment={rec_str!r}")
-                else:
-                    print(f"  {tag_name:30s}  cip=0x{cip_type:02X}  [no comment rows]")
-            except Exception as e:
-                print(f"  {tag_name:30s}  [error: {e}]")
-
-    # ── 3. Extended record attribute IDs for the first 5 rung tags ────────
-    print(f"\n--- Extended record attribute IDs (first 5 rung tags) ---")
-    for tag_name in rung_tags[:5]:
         cur.execute("SELECT record FROM comps WHERE comp_name=?", (tag_name,))
         rows = cur.fetchall()
         for (record,) in rows[:1]:
             try:
                 record = bytes(record)
                 r = RxGeneric.from_bytes(record)
-                cip = r.cip_type
-                attr_ids = [f"0x{a.attribute_id:02X}({len(bytes(a.value))}b)" for a in r.extended_records]
-                # Show attribute 0x01 contents (tag name + extra data)
                 ext = {a.attribute_id: bytes(a.value) for a in r.extended_records}
-                attr01_hex = ext.get(1, b"").hex()[:80]
-                print(f"  {tag_name:30s}  cip=0x{cip:02X}  attrs=[{', '.join(attr_ids)}]")
-                print(f"    attr[0x01] hex: {attr01_hex}")
-                # Print any attributes > 0x01 as hex
+                print(f"\n  [{tag_name}]  cip=0x{r.cip_type:02X}")
                 for attr_id, val in sorted(ext.items()):
-                    if attr_id == 1:
-                        continue
-                    print(f"    attr[0x{attr_id:02X}] hex: {bytes(val).hex()[:80]}")
+                    # Print full hex, 32 bytes per line
+                    hex_str = val.hex()
+                    lines = [hex_str[i:i+64] for i in range(0, len(hex_str), 64)]
+                    print(f"    attr[0x{attr_id:02X}] ({len(val)}b):")
+                    for line in lines:
+                        print(f"      {line}")
             except Exception as e:
-                print(f"  {tag_name:30s}  [error: {e}]")
+                print(f"  {tag_name}: [error: {e}]")
 
-    # ── 4. All comps entries that look like I/O module paths ──────────────
-    print(f"\n--- Comps entries that look like I/O module paths (contain 'Local:') ---")
-    cur.execute("SELECT comp_name, object_id, parent_id FROM comps WHERE comp_name LIKE 'Local:%'")
-    io_rows = cur.fetchall()
-    if io_rows:
-        for name, oid, pid in io_rows:
-            print(f"  {name:40s}  oid={oid}  parent={pid}")
-    else:
-        print("  (none found)")
+    # ── 3. Search all blob columns for known address byte patterns ────────
+    if known:
+        print(f"\n--- Searching all blobs for known address patterns ---")
+        # Build search needles: ASCII and UTF-16LE forms of each address
+        needles = {}
+        for tag, addr in known.items():
+            needles[tag] = [
+                addr.encode("ascii"),
+                addr.encode("utf-16-le"),
+            ]
+            # Also try colon-less variants: "I:1/0" → look for slot/bit as u32 pair
+            # Parse I:slot/bit or O:slot/bit
+            m = re.match(r"[IO]:(\d+)/(\d+)", addr)
+            if m:
+                slot, bit = int(m.group(1)), int(m.group(2))
+                needles[tag].append(struct.pack("<II", slot, bit))
+                needles[tag].append(struct.pack("<HH", slot, bit))
 
-    # ── 5. All non-empty tag_reference values in comments ─────────────────
-    print(f"\n--- All non-empty tag_reference values in comments (first 30) ---")
-    cur.execute(
-        "SELECT tag_reference, record_string, record_type, object_id "
-        "FROM comments WHERE tag_reference != '' LIMIT 30"
-    )
-    tr_rows = cur.fetchall()
-    if tr_rows:
-        for tag_ref, rec_str, rec_type, oid in tr_rows:
-            print(f"  type={rec_type:2d}  oid={oid}  tag_ref={tag_ref!r:40s}  comment={rec_str!r}")
-    else:
-        print("  (none found)")
+        tables = {
+            "comps": "SELECT comp_name, record FROM comps",
+            "comments": "SELECT object_id, record_string FROM comments",
+            "nameless": "SELECT object_id, record FROM nameless",
+            "pointers": "SELECT comp_name, record FROM pointers",
+        }
+        for table, query in tables.items():
+            try:
+                cur.execute(query)
+                for row in cur.fetchall():
+                    row_id = row[0]
+                    blob = row[1]
+                    if blob is None:
+                        continue
+                    if isinstance(blob, str):
+                        blob = blob.encode("utf-8")
+                    blob = bytes(blob)
+                    for tag, needle_list in needles.items():
+                        for needle in needle_list:
+                            pos = blob.find(needle)
+                            if pos != -1:
+                                ctx = blob[max(0, pos-8):pos+len(needle)+16].hex()
+                                print(f"  FOUND {tag}={known[tag]!r} in {table} row={row_id!r} "
+                                      f"offset={pos}  needle={needle.hex()}  context={ctx}")
+            except Exception as e:
+                print(f"  [{table}] error: {e}")
+
+    # ── 4. nameless table (first 5 rows) ──────────────────────────────────
+    print(f"\n--- nameless table (first 5 rows) ---")
+    try:
+        cur.execute("SELECT object_id, parent_id, length(record) FROM nameless LIMIT 5")
+        for oid, pid, rlen in cur.fetchall():
+            print(f"  oid={oid}  parent={pid}  record_len={rlen}")
+    except Exception as e:
+        print(f"  [error: {e}]")
+
+    # ── 5. pointers table (first 5 rows) ──────────────────────────────────
+    print(f"\n--- pointers table (first 5 rows) ---")
+    try:
+        cur.execute("SELECT comp_name, object_id, parent_id, length(record) FROM pointers LIMIT 5")
+        for name, oid, pid, rlen in cur.fetchall():
+            print(f"  {name:30s}  oid={oid}  parent={pid}  record_len={rlen}")
+    except Exception as e:
+        print(f"  [error: {e}]")
 
     print(f"\n{'='*70}\n")
 
