@@ -60,6 +60,10 @@ def main(argv=None):
     p = sub.add_parser("show", help="Print a human-readable summary of an RSL or ACD file")
     p.add_argument("input", help="Input .RSL or .ACD file")
 
+    # diagnose
+    p = sub.add_parser("diagnose", help="Dump raw tag/address data from an ACD for debugging")
+    p.add_argument("input", help="Input .ACD file")
+
     args = parser.parse_args(argv)
 
     if args.cmd == "rsl2l5x":
@@ -110,6 +114,11 @@ def main(argv=None):
     elif args.cmd == "show":
         project = _load(args.input)
         _print_summary(project)
+
+    elif args.cmd == "diagnose":
+        if Path(args.input).suffix.lower() != ".acd":
+            sys.exit("diagnose only works on .acd files")
+        acd_reader.diagnose(args.input)
 
 
 def _load(path: str) -> PLCProject:
