@@ -143,13 +143,19 @@ def pick_file(prompt: str, extension: str) -> Path:
 
 def _try_dialog(extension: str) -> Path | None:
     """Attempt to open a native file-picker dialog (works on Windows and macOS)."""
+    ext_label = extension.upper().lstrip(".")
+
+    # Try tkinter (works when Python was installed with Tk support, e.g. python.org installer)
     try:
         import tkinter as tk
         from tkinter import filedialog
         root = tk.Tk()
         root.withdraw()
-        root.attributes("-topmost", True)  # bring dialog to front on Windows
-        ext_label = extension.upper().lstrip(".")
+        if sys.platform == "win32":
+            root.attributes("-topmost", True)
+        else:
+            root.lift()
+            root.focus_force()
         result = filedialog.askopenfilename(
             title=f"Select a {ext_label} file",
             filetypes=[(f"{ext_label} files", f"*{extension}"), ("All files", "*.*")],
@@ -157,8 +163,21 @@ def _try_dialog(extension: str) -> Path | None:
         root.destroy()
         if result:
             return Path(result)
+        return None  # user cancelled
     except Exception:
         pass
+
+    # macOS fallback: AppleScript via osascript (no extra dependencies)
+    if sys.platform == "darwin":
+        try:
+            import subprocess
+            script = f'POSIX path of (choose file with prompt "Select a {ext_label} file")'
+            proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+            if proc.returncode == 0 and proc.stdout.strip():
+                return Path(proc.stdout.strip())
+        except Exception:
+            pass
+
     return None
 
 
@@ -409,6 +428,7 @@ def show_next_steps(output_format: str, output_path: Path):
 
 
 # ── Wizard flows ──────────────────────────────────────────────────────────
+
 
 def wizard_acd_to_rsl():
     header("Step 1 of 3: Select your ACD file")

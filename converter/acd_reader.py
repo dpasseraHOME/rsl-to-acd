@@ -157,8 +157,8 @@ def read_file(path: str | Path) -> PLCProject:
 def _build_project(cur: sqlite3.Cursor, name: str) -> PLCProject:
     project = PLCProject(name=name)
 
-    # ── Alias map: tag name → SLC-500 address (from Studio 5000 alias defs) ──
-    alias_map = _read_tag_alias_map(cur)
+    # ── Tag maps: I/O aliases + structured-type presets ───────────────────────
+    alias_map, preset_map = _read_tag_maps(cur)
 
     # ── Rungs ─────────────────────────────────────────────────────────────
     cur.execute("SELECT object_id, rung FROM rungs")
@@ -190,6 +190,7 @@ def _build_project(cur: sqlite3.Cursor, name: str) -> PLCProject:
     rungs: List[Rung] = []
     for idx, (oid, rung_text) in enumerate(raw_rungs):
         elements = _parse_s5k_rung(rung_text)
+        elements = _fill_placeholders(elements, preset_map)
         comment = comments.get(oid, "")
         rungs.append(Rung(number=idx, elements=elements, comment=comment))
 
@@ -203,61 +204,122 @@ def _build_project(cur: sqlite3.Cursor, name: str) -> PLCProject:
     return project
 
 
-def _read_tag_alias_map(cur: sqlite3.Cursor) -> Dict[str, str]:
-    """Build tag_name → SLC-500 address from alias tag definitions in the ACD.
+def _read_tag_maps(cur: sqlite3.Cursor) -> Tuple[Dict[str, str], Dict[str, int]]:
+    """Return (alias_map, preset_map) from a single pass over the comps table.
 
-    Studio 5000 stores alias-for paths (e.g. Local:1:I.Data.0) in the
-    comments table as tag_reference.  We look them up via the comment_id
-    embedded in each tag's binary record blob.
+    alias_map:  tag_name → SLC-500 I/O address  (e.g. "I:1/0", "O:2/3")
+    preset_map: tag_name → PRE value for COUNTER/TIMER structured tags
     """
+    from acd.generated.comps.rx_generic import RxGeneric
+
     alias_map: Dict[str, str] = {}
+    tag_to_dti: Dict[str, int] = {}   # tag name → data_table_instance oid
+    oid_to_record: Dict[int, bytes] = {}
+
     try:
-        cur.execute("SELECT comp_name, record FROM comps WHERE LENGTH(record) > 14")
+        cur.execute("SELECT comp_name, object_id, record FROM comps WHERE LENGTH(record) > 14")
         rows = cur.fetchall()
     except Exception:
-        return alias_map
+        return alias_map, {}
 
-    for comp_name, record in rows:
+    for comp_name, oid, record in rows:
         try:
             record = bytes(record)
-            if len(record) < 14:
-                continue
-            cip_type = struct.unpack_from("<H", record, 10)[0]
-            if cip_type not in (0x68, 0x6B):  # only tag objects
-                continue
-            comment_id = struct.unpack_from("<H", record, 12)[0]
-            parent_key = (comment_id * 0x10000) + cip_type
+            oid_to_record[oid] = record
+            r = RxGeneric.from_bytes(record)
 
-            cur.execute(
-                "SELECT tag_reference FROM comments WHERE parent=? AND tag_reference != ''",
-                (parent_key,),
-            )
-            for (tag_ref,) in cur.fetchall():
-                slc_addr = _io_path_to_slc(tag_ref)
-                if slc_addr:
-                    alias_map[comp_name] = slc_addr
-                    break
+            # I/O alias: encoded in extended attr[0x01]
+            ext = {a.attribute_id: bytes(a.value) for a in r.extended_records}
+            attr01 = ext.get(1, b"")
+            if len(attr01) >= 525:
+                bit_num = attr01[257]
+                direction = attr01[524]
+                if direction == 0x06:
+                    alias_map[comp_name] = f"O:2/{bit_num}"
+                elif direction == 0x05:
+                    alias_map[comp_name] = f"I:1/{bit_num}"
+
+            # Data-table instance for structured tags (COUNTER, TIMER …)
+            if not comp_name.startswith("$") and not comp_name.startswith("&"):
+                dti = r.main_record.data_table_instance
+                if dti and dti != 0xFFFFFFFF:
+                    tag_to_dti[comp_name] = dti
+
         except Exception:
             continue
 
-    return alias_map
+    # Build preset_map from data-table comps
+    preset_map: Dict[str, int] = {}
+    for tag_name, dti in tag_to_dti.items():
+        dt_record = oid_to_record.get(dti)
+        if dt_record is None:
+            continue
+        pre = _parse_pre_from_data_table(dt_record)
+        if pre is not None:
+            preset_map[tag_name] = pre
+
+    return alias_map, preset_map
 
 
-def _io_path_to_slc(path: str) -> Optional[str]:
-    """Convert a Studio 5000 I/O path to an SLC-500 address string.
+def _parse_pre_from_data_table(record: bytes) -> Optional[int]:
+    """Extract the PRE value from the last extended record (attr 0x66) of a data-table comp.
 
-    Local:N:I.Data.B  →  I:N/B
-    Local:N:O.Data.B  →  O:N/B
-    Local:N:I.Data    →  I:N      (word-level)
-    Local:N:O.Data    →  O:N
+    COUNTER/TIMER data tables store (Control DINT, PRE DINT) in their final
+    attribute.  Returns None if the record doesn't follow that layout.
     """
-    m = re.match(r"Local:(\d+):(I|O)\.Data\.(\d+)$", path, re.IGNORECASE)
-    if m:
-        return f"{m.group(2).upper()}:{m.group(1)}/{m.group(3)}"
-    m = re.match(r"Local:(\d+):(I|O)\.Data$", path, re.IGNORECASE)
-    if m:
-        return f"{m.group(2).upper()}:{m.group(1)}"
-    return None
+    try:
+        # RxGeneric fixed header: 14 bytes + 60-byte main_record + len_record (4) + count_record (4) = 82
+        if len(record) < 82:
+            return None
+        count_record = struct.unpack_from("<I", record, 78)[0]
+        if count_record < 1:
+            return None
+
+        # Skip count_record-1 regular AttributeRecords (each: 4 attr_id + 4 len + len data)
+        offset = 82
+        for _ in range(count_record - 1):
+            if offset + 8 > len(record):
+                return None
+            attr_len = struct.unpack_from("<I", record, offset + 4)[0]
+            offset += 8 + attr_len
+
+        # The last record uses LastAttributeRecord format where len_value includes itself
+        if offset + 8 > len(record):
+            return None
+        attr_id = struct.unpack_from("<I", record, offset)[0]
+        if attr_id != 0x66:
+            return None
+        total_size = struct.unpack_from("<I", record, offset + 4)[0]
+        data_size = total_size - 4
+        if data_size < 8 or offset + 8 + data_size > len(record):
+            return None
+        # data layout: Control DINT (4 bytes) + PRE DINT (4 bytes) [+ ACC DINT optional]
+        pre = struct.unpack_from("<i", record, offset + 12)[0]
+        return pre
+    except Exception:
+        return None
+
+
+def _fill_placeholders(
+    elements: List[RungElement], preset_map: Dict[str, int]
+) -> List[RungElement]:
+    """Replace ? operands in CTU/CTD/TON/TOF/RTO with actual preset values."""
+    result = []
+    for el in elements:
+        if isinstance(el, Instruction) and el.name in ("CTU", "CTD", "TON", "TOF", "RTO"):
+            new_ops = list(el.operands)
+            # Operand layout: [tag_name, PRE, ACC]
+            if len(new_ops) >= 2 and new_ops[1] == "?":
+                pre = preset_map.get(new_ops[0], 0)
+                new_ops[1] = str(pre)
+            if len(new_ops) >= 3 and new_ops[2] == "?":
+                new_ops[2] = "0"
+            result.append(Instruction(name=el.name, operands=new_ops))
+        elif isinstance(el, Branch):
+            result.append(Branch(legs=[_fill_placeholders(leg, preset_map) for leg in el.legs]))
+        else:
+            result.append(el)
+    return result
 
 
 def _is_metadata_comment(text: str) -> bool:
@@ -370,7 +432,7 @@ def _scan_operands(rung_text: str, registry: Dict[str, str]) -> None:
         instr = m.group(1)
         for op in m.group(2).split(","):
             op = op.strip()
-            if op and not op.lstrip("-").isdigit() and "." not in op:
+            if re.match(r"[A-Za-z][A-Za-z0-9_]*$", op) and "." not in op:
                 if op not in registry:
                     registry[op] = _infer_type_from_tag(op, instr)
 

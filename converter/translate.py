@@ -115,7 +115,7 @@ def _translate_elements(
     result = []
     for el in elements:
         if isinstance(el, Instruction):
-            new_ops = [mapping.get(op, op) for op in el.operands]
+            new_ops = [_translate_operand(op, mapping) for op in el.operands]
             result.append(Instruction(name=el.name, operands=new_ops))
         elif isinstance(el, Branch):
             new_legs = [
@@ -123,6 +123,33 @@ def _translate_elements(
             ]
             result.append(Branch(legs=new_legs))
     return result
+
+
+# SLC-500 bit offsets for structured tag members
+_COUNTER_BITS = {"CU": 15, "CD": 14, "DN": 13, "OV": 12, "UN": 11, "UA": 10}
+_TIMER_BITS   = {"EN": 15, "TT": 14, "DN": 13}
+
+def _translate_operand(op: str, mapping: Dict[str, str]) -> str:
+    """Translate a single operand, handling Base.Member dot-notation."""
+    if op == "?":
+        return "0"  # Studio 5000 placeholder for counter/timer PRE and ACC
+    if "." not in op:
+        return mapping.get(op, op)
+    base, member = op.split(".", 1)
+    slc = mapping.get(base)
+    if slc is None:
+        return op  # unknown base tag — leave as-is
+    member_up = member.upper()
+    # Counter bit members: C5:N/bit
+    if slc.startswith("C") and member_up in _COUNTER_BITS:
+        return f"{slc}/{_COUNTER_BITS[member_up]}"
+    # Timer bit members: T4:N/bit
+    if slc.startswith("T") and member_up in _TIMER_BITS:
+        return f"{slc}/{_TIMER_BITS[member_up]}"
+    # Word members (.ACC, .PRE): C5:N.ACC  /  T4:N.ACC etc.
+    if member_up in ("ACC", "PRE"):
+        return f"{slc}.{member_up}"
+    return op
 
 
 def _translate_tags(tags: List[Tag], mapping: Dict[str, str]) -> List[Tag]:
