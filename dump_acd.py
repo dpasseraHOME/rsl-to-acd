@@ -15,7 +15,6 @@ Output folder (default: dump/<stem>) will contain:
 import sys
 import os
 import shutil
-import struct
 import tempfile
 from pathlib import Path
 
@@ -75,17 +74,9 @@ def main():
             record = bytes(record)
             lines.append(f"\n[{comp_name}]  ({len(record)} bytes)")
 
-            # Basic header fields
-            if len(record) >= 12:
-                cip = struct.unpack_from("<H", record, 10)[0]
-                lines.append(f"  cip_type : 0x{cip:04X}")
-            if len(record) >= 14:
-                comment_id = struct.unpack_from("<H", record, 12)[0]
-                lines.append(f"  comment_id : {comment_id}")
-
-            # Extended attributes via RxGeneric
             try:
                 r = RxGeneric.from_bytes(record)
+                lines.append(f"  cip_type : 0x{r.cip_type:04X}")
                 for a in r.extended_records:
                     val = bytes(a.value)
                     # Try to decode as UTF-8 string (first 64 bytes)
